@@ -1,7 +1,7 @@
 import path from "node:path";
 import { hashObject } from "./src/fileOperations/hashObject.fileOperations";
 import { initRepo, catFile, addFile } from "./src/commands/index.commands";
-import { writeTreeCmd } from "./src/commands/tree/index.tree";
+import { lsTreeCmd, writeTreeCmd } from "./src/commands/tree/index.tree";
 
 // fetch gitty command by destructuring it
 const [, , command, ...args] = process.argv;
@@ -52,6 +52,21 @@ switch (command) {
     case "add":
         const paths: string[] = process.argv.slice(3);
         addFile(GIT_DIR, WORK_DIR, paths);
+        break;
+    case "ls-tree":
+        const inputArgs: string[] = process.argv.slice(3);
+        const inputArgsSize = inputArgs.length;
+        if (
+            (inputArgsSize > 1 && inputArgs[0] !== "--name-only") ||
+            inputArgsSize > 2
+        )
+            break;
+        let shaCode: string | undefined = inputArgs[0];
+        if (inputArgsSize == 2) shaCode = inputArgs[1];
+        if (inputArgsSize <= 1) lsTreeCmd(shaCode, false, "");
+        else if (inputArgsSize === 2 && inputArgs[0] === "--name-only")
+            lsTreeCmd(shaCode, true, inputArgs[0]);
+
         break;
     default:
         throw new Error(`error: unknown command: ${command}`);
