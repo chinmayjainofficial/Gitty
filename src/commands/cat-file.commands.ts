@@ -25,7 +25,7 @@ export function catFile(commitHash: string, flag: string) {
         const dirname = commitHash.slice(0, 2);
         const filename = commitHash.slice(2);
         // TODO: replace path of .git/ commit with .gitty/ commits
-        const objDir = path.join(process.cwd(), ".git", "objects", dirname);
+        const objDir = path.join(process.cwd(), ".gitty", "objects", dirname);
         const objPath = path.join(objDir, filename);
         if (!fs.existsSync(objPath))
             throw new Error(`fatal: Not a valid object name ${commitHash}`);
