@@ -1,0 +1,113 @@
+= Tree Concepts
+
+== Purpose and scope
+
+A tree is Gitty's representation of the names and organization of files and
+directories at one point in time. It describes a directory by associating each
+contained name with the object representing that entry. File contents live in
+blob objects; subdirectories are represented by other trees.
+
+This document covers the concepts and behavior of trees in the current Gitty
+implementation. It does not specify the tree object's byte format or document
+tree-related commands.
+
+== The tree hierarchy
+
+Each tree describes one directory level. A file entry refers to a blob, while a
+directory entry refers to a tree for that subdirectory. Starting at the root
+tree and following directory entries gives the complete included directory
+structure:
+
+[source,text]
+----
+root tree
+|-- README.md -> blob
+`-- src -> tree
+    |-- index.ts -> blob
+    `-- commands -> tree
+        `-- init.ts -> blob
+----
+
+The root tree is the entry point for a repository snapshot. A tree is not a
+complete project-wide flat file list: it describes only its own directory, and
+the nested tree references supply the rest of the hierarchy.
+
+== Trees and other Gitty objects
+
+Trees connect names and directory structure to content, but do not contain the
+file contents themselves:
+
+* A blob represents file content.
+* A tree represents a directory's entries and points to blobs or child trees.
+* A commit points to a root tree to identify the project snapshot for that
+  commit. Commits, rather than trees, connect snapshots into history through
+  parent-commit references.
+
+Consequently, a tree does not record commit history, a commit message, or when
+the snapshot was created. Those are commit-level concerns.
+
+== Content-addressed snapshots
+
+Tree object IDs are derived from the serialized tree data. Therefore, a tree's
+identity depends on its entries, including their names, modes, and referenced
+object IDs, rather than on the directory's absolute path or the time it was
+read.
+
+This has several consequences:
+
+* Rebuilding the same tree data produces the same object ID.
+* If a file's content changes, its blob ID changes, which changes the tree
+  containing it.
+* If a name or entry mode changes, the containing tree changes even when the
+  referenced blob does not.
+* A change in a nested directory changes that directory's tree and propagates
+  through each parent tree up to the root.
+* Moving or renaming a file changes the tree entry or entries, even if the
+  file's blob can be reused because its content is unchanged.
+* Identical file content can be represented by the same blob in different
+  places; the trees distinguish those occurrences by their names and
+  positions.
+
+Objects are stored by object ID, so identical tree data can reuse an existing
+tree object rather than require another copy.
+
+== Snapshot source and staging boundary
+
+The current tree builder recursively reads the working directory. It creates
+blob objects for files and tree objects for directories, then returns the root
+tree ID. It does not read the staging index.
+
+The staging index is a separate representation of staged paths and file
+metadata. Although Git-style workflows commonly build commits from the index,
+Gitty's current tree-building path snapshots the working directory instead.
+Thus, staged-but-uncommitted changes do not define the tree, and unstaged
+working-directory changes can be included. This is an implementation behavior,
+not a general property of trees.
+
+== Current inclusion behavior
+
+The current builder applies the following rules while traversing the working
+directory:
+
+* It skips entries named `.gitty` and `node_modules`.
+* It includes other files and directories, including hidden entries.
+* It creates a directory tree only when that directory has included entries.
+  Empty directories are therefore absent from the snapshot.
+* It assigns regular files mode `100644` and directories mode `40000`.
+  Executable permission differences are not reflected in the file mode.
+
+Because empty directories are omitted, adding or removing an empty directory
+does not change the tree snapshot. Adding a file to that directory makes its
+directory tree appear in the snapshot.
+
+== Snapshot versus working directory
+
+A tree is a stored snapshot, not a live view. Once created, its entries refer
+to the object IDs selected during construction. Later filesystem changes do not
+alter that tree; they produce different tree data only when another snapshot
+is built.
+
+This separation lets a commit refer to a stable root tree even as files in the
+working directory continue to change. Comparing root tree IDs can also identify
+whether the represented snapshot has changed without comparing each file's
+contents directly.
