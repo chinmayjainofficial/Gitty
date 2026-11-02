@@ -1,0 +1,300 @@
+= Tree Objects
+
+== Purpose
+
+A tree object records the contents of one directory at a particular point in
+time. It connects names in a directory (files and subdirectories) to the Gitty
+objects that hold their contents.
+
+A tree does not store the contents of a file itself. A file's contents are
+stored in a blob object, and the tree stores the blob's object ID beside the
+file name. For a subdirectory, the tree stores the object ID of another tree.
+This lets a commit refer to one root tree and, through it, describe the whole
+project.
+
+The tree-object constructor is `treeObject` in
+`src/objects/tree/tree.objects.ts`. It accepts an array of tree entries,
+serializes them into a `Buffer`, and returns the complete tree object bytes.
+It does not read a directory or write the resulting object to disk.
+
+In short:
+
+* A blob stores file contents.
+* A tree stores names, modes, and object IDs for one directory.
+* A commit points to a root tree, and may also point to a parent commit.
+
+== Serialized format
+
+A tree object is a sequence of bytes. It has a header followed by one entry for
+each file or subdirectory:
+
+[source,text]
+----
+tree <body-size>\0
+<mode> <name>\0<20-byte-object-id>
+<mode> <name>\0<20-byte-object-id>
+...
+----
+
+The notation `\0` means one null byte (byte value zero). It is a separator; the
+two characters backslash and zero are not stored in its place.
+
+The header contains:
+
+* `tree`: identifies this object as a tree.
+* `<body-size>`: the number of bytes in all entries after the header. It does
+  not include the header bytes.
+* A null byte separating the header from the entries.
+
+Each entry contains:
+
+. A mode, which describes the entry kind and permissions.
+. A space.
+. The entry's name (a file name or directory name).
+. A null byte ending the name.
+. The referenced object's ID as exactly 20 raw bytes.
+
+Gitty represents object IDs as 40-character hexadecimal SHA-1 strings in
+program code. While serializing an entry, `treeObject` converts the `sha`
+string from hexadecimal to bytes with `Buffer.from(e.sha, "hex")`. The tree
+therefore stores the binary form, not the 40-character text form.
+
+The entry name and mode are encoded as text in a buffer; the object ID is
+appended as raw bytes. These components are concatenated without extra
+separators: the mode and name are separated by a space, the name and object ID
+by a null byte, and the next entry begins immediately after the 20-byte ID.
+
+== Entry input type
+
+The `TreeEntry` type in `src/objects/tree/types/treeObject.types.ts` defines
+the constructor's input shape:
+
+[source,typescript]
+----
+type TreeEntry = {
+    mode: string;
+    name: string;
+    sha: string;
+};
+----
+
+The type describes the expected values but the serializer does not validate
+them at runtime. It does not check that the mode is recognized, that the name
+is valid, or that `sha` is a complete 40-character object ID. Callers are
+responsible for providing well-formed entries.
+
+== Example
+
+Suppose a directory has a file called `hello.txt` whose blob ID is shown
+symbolically as `0123456789abcdef...`. Its entry has this readable shape:
+
+[source,text]
+----
+100644 hello.txt\0<20 raw bytes for the blob ID>
+----
+
+If the directory also has a subdirectory called `src`, the root tree has an
+entry pointing to the tree object for `src`:
+
+[source,text]
+----
+40000 src\0<20 raw bytes for the src tree ID>
+----
+
+The angle-bracketed bytes above are placeholders for binary data. They are not
+literal text stored in the object.
+
+At the byte level, each entry contributes the UTF-8 bytes for
+`<mode> <name>`, one null byte, and the raw bytes decoded from the hex ID.
+Readable diagrams use `\0` and placeholders to show the boundaries, but the
+object is a binary buffer and may contain non-text bytes.
+
+== Modes used by this project
+
+The tree builder currently creates these modes:
+
+|===
+|Mode |Meaning |Object referenced
+
+|`100644`
+|A regular file
+|A blob
+
+|`40000`
+|A directory
+|Another tree
+|===
+
+The listing code also recognizes mode `160000` as a commit reference,
+commonly used for a submodule-like entry. The current tree builder does not
+create entries with that mode. `treeObject` itself does not impose this mode
+set; it serializes whatever string a caller supplies.
+
+== How Gitty builds a tree
+
+The `buildTree` function in
+`src/commands/tree/buildTree.tree.commands.ts` creates a tree recursively,
+starting at a directory:
+
+. It reads the names in the directory.
+. It skips entries named `.gitty` and `node_modules`.
+. For each regular file, it reads the file's bytes, makes a blob object, and
+  stores that blob. The resulting blob ID is placed in a `100644` entry.
+. For each directory, it recursively builds that directory's tree. If that
+  directory has entries, its tree ID is placed in a `40000` entry.
+. It serializes the entries into a tree object, stores it, and returns the
+  tree's object ID.
+
+This is a bottom-up process: child directories are written before their parent
+tree, so the parent can refer to each child tree's ID. The root tree describes
+the whole included directory structure by following these references.
+
+An empty directory has no entries, so `buildTree` returns `null` for it rather
+than writing an empty tree. As a result, an empty root directory also produces
+`null`.
+
+The builder includes files and directories that are not specifically excluded,
+including hidden files. It does not record file permissions beyond the mode it
+assigns to regular files, and it does not include empty directories.
+
+The builder creates entries with the `TreeEntry` shape (`mode`, `name`, and
+`sha`) and passes each non-empty directory's array to `treeObject`. The
+constructor handles sorting and serialization; the builder handles filesystem
+traversal and chooses which entries and modes to include.
+
+== Entry ordering
+
+Before serializing entries, `treeObject` makes a shallow copy of the input
+array and sorts the copy. For each entry it creates a sort key with
+`Buffer.from`: the key is the entry name, except that a mode exactly equal to
+`40000` gets `/` appended. It compares the resulting buffers with
+`Buffer.compare`.
+
+The slash for a directory is only part of its sort key. The serialized name
+remains unchanged. The function does not mutate the caller's array, and it
+does not sort entries by their object IDs or modes independently.
+
+This makes ordering deterministic for the same entry values, regardless of
+the order in which the caller supplied them. Comparison is byte-wise over the
+buffer-encoded keys. The serializer applies directory treatment only for mode
+`40000`; any other mode is sorted as a file-like name.
+
+== Constructor internals
+
+For `treeObject(entries)`, the implementation performs these operations:
+
+. Copies and sorts `entries` using the sort-key rule described above.
+. For every sorted entry, creates a buffer for `<mode> <name>\0`.
+. Converts the entry's `sha` from hexadecimal into a buffer.
+. Concatenates the text buffer and the ID bytes to form that entry.
+. Concatenates all entry buffers to form the tree body.
+. Creates a header buffer containing `tree <body.length>\0`.
+. Concatenates the header and body, returning the complete tree object buffer.
+
+The body size in the header is measured in bytes after encoding and
+concatenation. It includes every entry's mode, name, separators, and 20-byte
+ID, but excludes the header itself.
+
+If `entries` is an empty array, the constructor returns a validly shaped
+buffer containing `tree 0\0` and an empty body. The recursive builder does not
+call it for empty directories: `buildTree` returns `null` when it has no
+entries, so this empty-tree case is available to direct callers but is not
+produced by the normal tree-building path.
+
+== Validation and malformed input
+
+The constructor trusts its input. Among other things, it does not:
+
+* Enforce a 40-character hexadecimal SHA or verify that it decodes to exactly
+  20 bytes.
+* Validate mode strings, entry names, encoding, or duplicate entries.
+* Check that the referenced object exists or is the expected type.
+* Recalculate the size after serialization; it simply uses the resulting
+  body's `Buffer.length`.
+
+For example, Node's hexadecimal buffer decoding consumes valid hex pairs and
+does not itself establish that the source string is a full object ID. A
+malformed `sha` can therefore produce an entry with an unexpected ID byte
+length. The output follows the bytes produced by `Buffer.from`, even if that
+does not match the normal 20-byte entry convention.
+
+The serializer also does not reject names containing bytes or characters that
+would be unusual in a filesystem name. Such names are encoded using the
+default encoding of `Buffer.from` (UTF-8). Correct parsing depends on the
+conventional entry separators and expected fixed-length object IDs.
+
+== Object IDs and storage
+
+`treeObject` only produces bytes. The `writeObject` helper in
+`src/objects/store/objectStore.objects.ts` calculates the tree ID by applying
+SHA-1 to the complete tree object bytes, including the `tree <size>\0` header.
+It then compresses the bytes and writes the object under a path derived from
+its ID:
+
+[source,text]
+----
+.gitty/objects/<first two ID characters>/<remaining ID characters>
+----
+
+If an object with that ID is already present, the object store does not write
+another copy. Identical tree data therefore has the same ID and can be reused.
+Changing an entry (for example, changing a file's contents, name, or referenced
+blob ID) changes the tree bytes and consequently its ID.
+
+The constructor does not compress data, calculate hashes, inspect the object
+store, or decide where an object is persisted. It is a pure byte-construction
+step; hashing and persistence happen in the caller.
+
+== Reading and displaying entries
+
+The `lsTreeCmd` implementation inflates a stored object, checks that the
+header begins with `tree `, and then scans entries from the first byte after
+the header's null separator. For each entry, it locates the mode/name space,
+the name-ending null byte, reads the next 20 bytes as the object ID, converts
+those bytes back to hexadecimal, and continues after the ID.
+
+That reader assumes the normal entry layout, including a 20-byte object ID.
+It is not a general validation routine for arbitrary or malformed serialized
+trees.
+
+== Related commands
+
+=== `write-tree`
+
+`writeTreeCmd` starts tree building at the current working directory. It
+returns the root tree ID, or `null` when the directory has no included entries.
+
+=== `ls-tree`
+
+`lsTreeCmd` reads a tree object, checks that its header identifies a tree, and
+prints each entry. In the normal listing format, it prints the mode, object
+type, object ID, and name. With the `--name-only` option, it prints just the
+names.
+
+The listing code identifies mode `40000` as a tree and mode `160000` as a
+commit; other modes are shown as blobs. It reads each entry's object ID as 20
+bytes and converts it back to hexadecimal for display.
+
+[IMPORTANT]
+====
+There is a path mismatch in the current implementation: tree and blob objects
+are written under `.gitty/objects`, but `lsTreeCmd` currently looks under
+`.git/objects`. As a result, a tree created by `writeTreeCmd` may not be found
+by `lsTreeCmd` unless the object is also present under `.git/objects`. The
+writer and reader paths need to be made consistent for the commands to work
+together directly.
+====
+
+== Source files
+
+The tree object and tree commands are implemented in these files:
+
+* `src/objects/tree/tree.objects.ts` serializes and sorts tree entries.
+* `src/objects/tree/types/treeObject.types.ts` defines the shape of one entry:
+  `mode`, `name`, and `sha`.
+* `src/commands/tree/buildTree.tree.commands.ts` reads the working directory,
+  creates blobs and nested trees, and stores them.
+* `src/commands/tree/write-tree.commands.ts` starts building at the current
+  working directory.
+* `src/commands/tree/ls-tree.commands.ts` reads and displays a tree's entries.
+* `src/commands/tree/index.tree.ts` exports the tree-related functions.

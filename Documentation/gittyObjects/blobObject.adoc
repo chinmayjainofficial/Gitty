@@ -1,0 +1,153 @@
+= Blob Objects
+
+== Purpose
+
+A blob object stores file contents as bytes. In Gitty, the blob constructor
+wraps those bytes with an object-type and size header, producing the complete
+buffer that is subsequently hashed and, when requested, compressed and stored.
+
+The implementation is named `blobObject` and is in
+`src/objects/blob.objects.ts`. There is no `blobObject.utils.ts` file in the
+current source tree. The constructor is re-exported by
+`src/objects/index.objects.ts`.
+
+This document focuses on blob behavior and its use by Gitty. Tree and commit
+object formats are separate topics.
+
+== What a blob contains
+
+A blob represents content, not a file's location in the working tree. It does
+not include the file name, path, permissions, timestamps, or directory
+structure. Those details are handled elsewhere, such as by tree entries and
+the staging index.
+
+If two files have identical bytes, their blob-object buffers are identical,
+even if their names or paths differ. When these buffers are hashed, they
+therefore receive the same object ID.
+
+== Blob object structure
+
+The constructor creates a buffer with a header followed by the original file
+bytes:
+
+[source,text]
+----
+blob <size-in-bytes>\0<content-bytes>
+----
+
+The components are:
+
+* `blob` identifies the object type.
+* `<size-in-bytes>` is the length of the content buffer.
+* `\0` is one null byte that separates the header from the payload.
+* `<content-bytes>` is the input buffer copied without text conversion.
+
+The header is UTF-8 text created by a JavaScript template string. The payload
+is binary-safe: it is appended as a `Buffer`, so arbitrary byte values,
+including null bytes and non-text data, are preserved.
+
+For example, if the content is the three UTF-8 bytes for `cat`, the resulting
+object has this conceptual representation:
+
+[source,text]
+----
+blob 3\0cat
+----
+
+The notation `\0` here represents a single zero-valued byte. It is not stored
+as two visible characters.
+
+== Constructor implementation
+
+The implementation is intentionally small:
+
+[source,typescript]
+----
+export function blobObject(fileContent: Buffer): Buffer {
+    const header = Buffer.from(`blob ${fileContent.length}\0`);
+    return Buffer.concat([header, fileContent]);
+}
+----
+
+Its internal operation is:
+
+. Receive a `Buffer` containing the file content.
+. Read `fileContent.length`, which is the number of bytes, not the number of
+  characters.
+. Build the header buffer from `blob`, a space, the byte length, and a null
+  separator.
+. Concatenate the header buffer and original content buffer.
+. Return the resulting buffer.
+
+The constructor does not access the filesystem, calculate an object ID,
+compress the buffer, or write it to the object database. Those responsibilities
+belong to callers and object-storage helpers.
+
+== Size is measured in bytes
+
+The size in the header comes from `Buffer.length`. This is important for
+multibyte text: a string's character count can differ from its encoded byte
+length. The constructor receives bytes and records their exact byte count,
+which is also the number of payload bytes appended after the header.
+
+An empty content buffer is valid. It produces a header with a size of zero,
+followed by the separator and no payload bytes.
+
+== From a file to a stored blob
+
+The file-level helper `hashObject` in
+`src/fileOperations/hashObject.fileOperations.ts` uses `blobObject` as part of
+this flow:
+
+. Resolve the file path against the supplied working directory.
+. Check that the resolved path exists and read it synchronously into a
+  `Buffer`.
+. Pass the content buffer to `blobObject`.
+. Hash the complete blob buffer with `hashFileObject`.
+. If writing is requested, compress and store the blob under the object
+  directory path derived from its hash.
+
+The hash covers the entire blob buffer, including the type, size, separator,
+and payload. It is not calculated over the raw file content alone.
+
+The `buildTree` implementation also reads file bytes and calls `blobObject`,
+then passes the result to `writeObject`. Both paths construct the same blob
+representation, although their storage helpers and object-directory path
+handling differ.
+
+== Content addressing and reuse
+
+Gitty identifies an object by hashing its complete serialized bytes. Since
+the blob header includes the payload size and the payload contains the exact
+file bytes, the same content produces the same blob ID.
+
+This allows identical content to be reused in different paths. The name and
+path do not affect the blob ID; they are associated with that ID by the
+containing tree or index entry. Changing the content changes the blob buffer
+and therefore changes the input to hashing.
+
+When a caller writes the blob, it stores the compressed buffer at a path
+derived from the object ID. Storage helpers skip writing when the expected
+object path already exists.
+
+== Input handling and limitations
+
+`blobObject` accepts a `Buffer` by type but performs no runtime validation. It
+does not check for a missing value, verify that the input is a file's content,
+or validate any encoding. It treats the input as opaque bytes.
+
+The function also does not validate or parse blobs. It only constructs the
+header and payload buffer. Object hash verification, compression, persistence,
+and later reading are handled by other modules.
+
+== Implementation reference
+
+* `src/objects/blob.objects.ts` constructs a blob buffer from content bytes.
+* `src/objects/index.objects.ts` re-exports `blobObject`.
+* `src/fileOperations/hashObject.fileOperations.ts` reads a file, constructs
+  its blob, hashes it, and optionally writes it.
+* `src/commands/tree/buildTree.tree.commands.ts` creates blob objects for
+  files while building trees.
+* `src/utils/hashing/hashFileObject.utils.ts` hashes complete object buffers.
+* `src/objects/store/objectStore.objects.ts` compresses and stores objects
+  created through the tree-building path.
