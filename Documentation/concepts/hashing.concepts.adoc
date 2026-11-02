@@ -1,0 +1,220 @@
+= Object Hashing Concepts
+
+== Purpose and scope
+
+Gitty uses hashing to assign an object ID to the complete serialized object
+bytes. For files, the `hashObject` operation first wraps the file bytes in a
+blob object, then hashes that blob object. It can optionally store the
+compressed blob in the object database.
+
+This document explains the behavior of:
+
+* `hashFileObject` in `src/utils/hashing/hashFileObject.utils.ts`.
+* `hashObject` in `src/fileOperations/hashObject.fileOperations.ts`.
+* The `hash-object` CLI argument flow and the related callers that create
+  blob objects.
+
+It documents the implementation as it exists in this repository; it does not
+describe all behavior of Git's hashing commands.
+
+== Two separate operations
+
+The similarly named helpers perform different roles:
+
+[cols="1,2,2",options="header"]
+|===
+|Helper |Input |Responsibility
+
+|`hashFileObject`
+|A `Buffer` containing a complete object.
+|Calculates the SHA-1 digest and returns it as lowercase hexadecimal.
+
+|`hashObject`
+|A file path, working-directory path, object-directory path, and write flag.
+|Reads the file, creates a blob object, hashes it, and optionally stores it.
+|===
+
+`hashFileObject` is the lower-level digest helper. It does not read files,
+construct blob headers, compress data, or write objects. `hashObject` handles
+those file/blob-specific steps and delegates the digest calculation to
+`hashFileObject`.
+
+== What bytes are hashed
+
+For a file, `hashObject` reads the file bytes and passes them to `blobObject`.
+That helper constructs a buffer with this general structure:
+
+[source,text]
+----
+blob <content-size>\0<file-bytes>
+----
+
+The size is the number of bytes in the file content. The null byte separates
+the header from the content. `hashFileObject` hashes the entire resulting
+buffer, including the `blob` type, size, separator, and file content.
+
+The object ID is therefore not calculated from the raw file bytes alone, and
+it is not calculated from the file name or path. Two files with identical
+bytes produce identical blob data and the same object ID, regardless of their
+names or locations.
+
+== Hashing algorithm and object ID
+
+`hashFileObject` uses Node.js `crypto.createHash("sha1")`, updates the hash
+with the supplied buffer, and requests the digest in hexadecimal form:
+
+[source,typescript]
+----
+crypto.createHash("sha1").update(obj).digest("hex")
+----
+
+The returned SHA-1 digest is a 40-character lowercase hexadecimal string.
+Given identical input bytes, this deterministic algorithm returns the same
+digest. Changing any byte in the serialized object changes the hash input and
+normally results in a different digest.
+
+In this implementation, this SHA-1 digest is the object's identifier. It is
+used both for displaying/recording the object ID and, when writing is enabled,
+for deriving the object's storage path.
+
+== `hashFileObject` internal behavior
+
+The function accepts an object buffer and:
+
+. Checks that the argument is truthy.
+. Creates a SHA-1 hash.
+. Feeds the complete buffer into the hash.
+. Returns the digest in hexadecimal format.
+
+If an error is thrown, the helper writes its message to standard error and
+calls `process.exit(1)`. A zero-length `Buffer` is truthy in JavaScript and is
+hashed; the guard rejects a missing/falsy argument, not an empty buffer.
+
+The helper does not validate the object header, object type, or correspondence
+between the object bytes and any expected ID. It simply hashes the bytes it
+receives.
+
+== `hashObject` internal behavior
+
+The function signature is:
+
+[source,typescript]
+----
+hashObject(
+  GIT_DIR: string,
+  WORK_DIR: string,
+  filePath: string | undefined,
+  writeFlag: boolean
+): string | null
+----
+
+Its steps are:
+
+. If `filePath` is absent, return `null` immediately.
+. Resolve the file path against `WORK_DIR` using `path.resolve`.
+. Check that the resolved path exists. If it does not, throw a
+   `could not open ... No such file or directory` error.
+. Read the path contents synchronously as a `Buffer`.
+. Construct a blob object from those bytes using `blobObject`.
+. Hash the complete blob buffer with `hashFileObject`.
+. If `writeFlag` is false, return the hash immediately without writing an
+   object file.
+. If writing is enabled, split the hash into a two-character directory prefix
+   and the remaining filename.
+. Form the storage path using `GIT_DIR/objects/<prefix>/<suffix>`.
+. If that object path does not already exist, recursively create the prefix
+   directory and write the zlib-compressed blob buffer there.
+. Return the hash.
+
+The implementation uses synchronous filesystem and compression operations.
+The return value is the object ID, except when no file path was supplied, in
+which case it is `null`.
+
+== Hash-only and write modes
+
+The `writeFlag` controls whether the blob is persisted:
+
+* When false, `hashObject` still reads the file, constructs the blob bytes,
+  and computes the object ID, but does not write the object.
+* When true, it additionally writes the compressed blob unless the expected
+  object path already exists.
+
+Both modes return the same ID for the same file bytes. Hashing without
+writing does not create the object directory.
+
+The CLI recognizes `-w` anywhere in the arguments after `hash-object` and
+uses the first argument that is not exactly `-w` as the file path. For
+example:
+
+[source,shell]
+----
+bun run index.ts hash-object README.md
+bun run index.ts hash-object -w README.md
+bun run index.ts hash-object README.md -w
+----
+
+If no non-`-w` argument is present, the CLI receives `null` from `hashObject`
+and prints no hash. The CLI prints the hash followed by a newline whenever
+the result is not `null`.
+
+== Object storage
+
+When write mode is enabled, the uncompressed blob buffer is compressed with
+zlib and stored using this layout:
+
+[source,text]
+----
+<GIT_DIR>/objects/<first-two-hash-characters>/<remaining-hash-characters>
+----
+
+The object ID is derived from the uncompressed serialized blob, not from its
+compressed representation. If a file already exists at the expected object
+path, the helper skips the write and returns the computed hash.
+
+`hashObject` does not verify the contents of an existing object file before
+skipping the write. It also does not create `GIT_DIR` itself except
+indirectly when the object prefix directory is created during a write.
+
+== Error behavior and limitations
+
+`hashObject` catches errors from its own file checks, reads, and writes, emits
+the error message to standard error, and exits with status `1`. The
+`hashFileObject` helper uses the same stderr-and-exit pattern for errors in
+hash computation.
+
+The implementation does not:
+
+* Validate that the path refers to a regular file before reading it.
+* Hash the path, file name, permissions, or timestamps.
+* Verify an existing compressed object against its name or contents.
+* Write an object unless `writeFlag` is true.
+* Use a configurable hash algorithm; the implementation is hard-coded to
+  SHA-1.
+
+Because file reading is delegated to `fs.readFileSync`, passing a directory
+or another unreadable path can produce a filesystem error. The catch block
+reports such errors and exits rather than returning a hash.
+
+== Related callers
+
+`hashObject` is used by:
+
+* The `hash-object` CLI, which optionally writes the blob based on `-w`.
+* The staging operation, which calls it with writing enabled and records the
+  returned blob ID and file mode in the index.
+
+Tree construction uses the same lower-level ideas but creates and stores
+blobs through `blobObject` and `writeObject`, then uses `hashFileObject` via
+the object store. Thus, object IDs are based on complete serialized object
+bytes in both paths, while the storage helpers and directory-path handling
+differ.
+
+== Implementation reference
+
+* `src/utils/hashing/hashFileObject.utils.ts` hashes a supplied object buffer.
+* `src/fileOperations/hashObject.fileOperations.ts` reads file contents,
+  constructs blob objects, and optionally stores them.
+* `src/objects/blob.objects.ts` creates the blob header and payload buffer.
+* `index.ts` parses `hash-object` arguments and prints the resulting ID.
+* `src/commands/add-file-staging-area.commands.ts` writes blob objects while
+  staging files.

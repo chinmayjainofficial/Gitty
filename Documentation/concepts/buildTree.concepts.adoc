@@ -1,0 +1,214 @@
+= `buildTree` Concept
+
+== Purpose
+
+`buildTree` recursively converts a directory on disk into Gitty objects and
+returns the object ID of the tree representing that directory. Files become
+blob objects; non-empty subdirectories become child tree objects. The result
+is a bottom-up snapshot of the included filesystem entries.
+
+The implementation is in `src/commands/tree/buildTree.tree.commands.ts`.
+`writeTreeCmd` calls it with the current working directory, but `buildTree`
+itself accepts an explicit base path.
+
+This document focuses on the traversal and object-building behavior. It does
+not specify the tree object's byte format or document the `write-tree`
+command.
+
+== Inputs and result
+
+The function signature is:
+
+[source,typescript]
+----
+buildTree(basePath: string): string | null
+----
+
+`basePath` is the directory whose immediate contents should be represented.
+The result is:
+
+* A string object ID when the directory contains at least one included file or
+  non-empty child directory.
+* `null` when the directory has no included entries.
+
+The function does not return the tree data itself. It writes the resulting
+objects to the object store and returns their IDs.
+
+== Traversal model
+
+The traversal is recursive and bottom-up. For each directory, the function
+collects entries for its direct children. Before a parent can refer to a
+subdirectory, that subdirectory is recursively built and stored.
+
+[source,text]
+----
+working directory
+|-- file.txt       -> write blob -> blob ID
+`-- src            -> recursively build -> child tree ID
+    |-- index.ts   -> write blob -> blob ID
+    `-- lib        -> recursively build -> nested tree ID
+
+then write the tree for each directory from the deepest child to the root
+----
+
+Each directory has a local `result` array of `TreeEntry` values. Entries
+contain a mode, name, and object ID. Once all eligible children have been
+processed, that array is passed to the tree-object serializer and the
+resulting tree object is stored.
+
+== Detailed execution
+
+For each call to `buildTree(basePath)`, the implementation performs these
+steps:
+
+. Reads the directory names with `fs.readdirSync(basePath)`.
+. Starts an empty list of tree entries.
+. Processes each returned name:
+.. Skips the name if it is exactly `.gitty` or `node_modules`.
+.. Joins the name to `basePath` to get the entry's full path.
+.. Calls `fs.statSync` to inspect the entry.
+.. If it is a directory, recursively calls `buildTree` on it. If recursion
+   returns a tree ID, appends a directory entry with mode `40000`.
+.. If it is a regular file, reads its bytes, constructs and stores a blob,
+   then appends a file entry with mode `100644`.
+.. If it is neither a directory nor a regular file, it adds no tree entry.
+. If the entry list is empty, returns `null` without creating a tree object.
+. Otherwise, constructs a tree object from the entries, writes it to the
+   object store, and returns its object ID.
+
+The serializer is responsible for deterministic entry ordering and tree
+serialization. `buildTree` itself accumulates entries in filesystem iteration
+order.
+
+== File-to-blob processing
+
+For every regular file, the private `convertFiletoFileObject` helper:
+
+. Reads the file as a `Buffer` with `fs.readFileSync`.
+. Wraps the bytes as a blob object using `blobObject`.
+. Passes the complete blob object to `writeObject`.
+. Returns the blob's object ID.
+
+The file name and path are not part of the blob. They are stored in the
+containing tree entry. Thus, equal file bytes can reuse the same blob object
+even when the files have different names or are in different directories.
+
+File entries created by this builder always use mode `100644`; the builder
+does not preserve executable bits or other filesystem permission differences.
+
+== Directory-to-tree processing
+
+For a directory child, `buildTree` first builds that child's contents. If the
+recursive call returns an object ID, the parent appends an entry with mode
+`40000`, the child directory's name, and that ID.
+
+If recursion returns `null`, the parent does not add an entry for that
+directory. Consequently:
+
+* Empty directories are not represented.
+* A directory containing only skipped entries is also treated as empty.
+* A nested directory appears only if it ultimately contains an included
+  regular file or a non-empty child tree.
+
+== Inclusion and exclusion rules
+
+The implementation has two explicit name exclusions. At every traversed
+directory level, entries named exactly `.gitty` and `node_modules` are
+skipped. The comparison is by name, not by path or file type.
+
+Other names are not filtered by this function. In particular:
+
+* Hidden files are included unless their name is one of the explicit
+  exclusions.
+* `.git` is not excluded by `buildTree`.
+* Ignore files are not read and ignore patterns are not applied.
+* Only entries for which `statSync` reports a regular file or directory are
+  added. Other filesystem entry types are ignored.
+
+The `fs.statSync` call follows symbolic links. A symlink to a directory is
+therefore traversed as a directory; a symlink to a regular file is read and
+represented as a regular file entry. The tree stores the path's name and the
+resulting content/tree ID, not a symbolic-link object.
+
+== Object creation and storage
+
+Each file blob is stored as the traversal reaches that file. After the
+children of a directory have been processed, its tree object is created and
+stored. This means descendants are written before their parent tree.
+
+`writeObject` calculates an ID from the complete object bytes, compresses the
+object, and stores it under:
+
+[source,text]
+----
+.gitty/objects/<first-two-id-characters>/<remaining-id-characters>
+----
+
+If an object with the same ID already exists at that location, `writeObject`
+returns the ID without writing another copy. This makes repeated builds able
+to reuse unchanged blobs and trees.
+
+The object-store path is based on `process.cwd()`, not on `basePath`. Therefore,
+when `buildTree` is called programmatically with a base path outside the
+current working directory, it still writes objects to the current directory's
+`.gitty/objects` store.
+
+== Relationship to the serialized tree
+
+`buildTree` determines which entries exist, their names, modes, and referenced
+object IDs. It delegates the byte representation and ordering of those entries
+to `treeObject`.
+
+The `treeObject` implementation sorts entries before serialization; directory
+sort keys include a trailing slash. This sorting makes the resulting tree
+object independent of the order in which the filesystem returned the names.
+For details of the serialized header and entry bytes, see the separate tree
+object documentation.
+
+== Edge cases and failures
+
+=== Empty or fully excluded directories
+
+If all children are excluded, unsupported entry types, or empty directories,
+the function returns `null`. No tree object is created for that directory.
+
+=== Missing paths and filesystem errors
+
+The function does not validate `basePath` or wrap its work in a `try`/`catch`.
+Errors from `readdirSync`, `statSync`, `readFileSync`, tree serialization, or
+object storage propagate to the caller. Examples include a missing or
+unreadable directory, an unreadable file, and object-store write failures.
+
+=== Partial object writes
+
+Object writes happen during traversal, before the complete root tree is known.
+If a later operation fails, already-written blob or child-tree objects are
+not rolled back. They remain in the object store, though the root tree may not
+have been created.
+
+=== Links and cycles
+
+Because `statSync` follows symbolic links and there is no cycle detection, a
+directory symlink that leads back to an ancestor can cause recursive traversal
+to continue until the process encounters a system or runtime failure.
+
+== Relationship to the staging index
+
+`buildTree` reads the filesystem directly. It does not read `.gitty/index` and
+does not use staged index entries or their modes. As a result, its output
+represents the included working-directory contents at traversal time, not
+necessarily the staged state.
+
+This is specific to the current implementation; a tree as a data structure
+does not inherently require that it be built from the working directory.
+
+== Implementation reference
+
+* `src/commands/tree/buildTree.tree.commands.ts` traverses directories and
+  builds entries recursively.
+* `src/objects/blob.objects.ts` wraps file bytes as blob objects.
+* `src/objects/tree/tree.objects.ts` sorts and serializes tree entries.
+* `src/objects/store/objectStore.objects.ts` hashes, compresses, and stores
+  generated objects.
+* `src/commands/tree/write-tree.commands.ts` invokes `buildTree` for the
+  current working directory.
