@@ -1,0 +1,201 @@
+= Tree Commands
+
+== Purpose and scope
+
+This guide documents the behavior of the tree-related commands currently
+implemented in Gitty:
+
+* `write-tree` creates and stores a snapshot tree from the working directory.
+* `ls-tree` reads a tree and lists its direct entries.
+* `commit-tree` creates a commit that refers to a tree and a parent commit.
+
+It focuses on command behavior, relationships, and implementation limitations.
+It does not describe the tree object's byte format; see the separate tree
+object documentation for that topic.
+
+Commands are dispatched by `index.ts`. Examples below use
+`bun run index.ts <command>`.
+
+== Command overview
+
+[cols="1,2,2",options="header"]
+|===
+|Command |Input |Result
+
+|`write-tree`
+|No command-line arguments; uses the current working directory.
+|Stores included blobs and trees, and prints the root tree ID when one exists.
+
+|`ls-tree`
+|A tree object ID, optionally preceded by `--name-only`.
+|Prints the tree's direct entries, or just their names.
+
+|`commit-tree`
+|A tree object ID, `-p <parent-id>`, and `-m <message>`.
+|Intended to store and print a commit ID referring to the supplied tree and
+parent.
+|===
+
+== `write-tree`
+
+=== Purpose
+
+`write-tree` constructs a snapshot rooted at the process's current working
+directory. It returns the root tree ID; the CLI prints that ID if it is not
+`null`.
+
+[source,shell]
+----
+bun run index.ts write-tree
+----
+
+=== Snapshot behavior
+
+The builder traverses directories recursively, creating child directory trees
+before their parents. For files, it stores a blob and includes that blob's ID
+in the containing tree. The final tree ID represents the complete included
+directory hierarchy.
+
+The command snapshots the working directory directly. It does not consult the
+staging index, so staged state does not determine the result. Unstaged changes
+that are present in the working directory can be included.
+
+The builder skips entries named `.gitty` and `node_modules`, includes other
+files and directories (including hidden entries), and omits empty directories.
+It assigns regular files mode `100644` and directories mode `40000`.
+
+=== Empty directories
+
+When a directory contains no included entries, the recursive builder returns
+`null` for that directory and the parent omits it. If the root has no included
+entries, `write-tree` prints no tree ID and exits through the normal command
+path; it does not create an empty root tree.
+
+=== Storage and output
+
+Blobs and trees are written to the `.gitty/objects` store. Existing objects
+with the same ID are reused. The command's useful output is the root tree ID,
+not a listing of every object it created.
+
+== `ls-tree`
+
+=== Purpose and supported forms
+
+`ls-tree` displays the direct entries recorded in a tree. The currently
+supported CLI forms are:
+
+[source,shell]
+----
+bun run index.ts ls-tree <tree-id>
+bun run index.ts ls-tree --name-only <tree-id>
+----
+
+The command uses the supplied value as an object ID, deriving the object path
+from its first two characters and the remaining suffix. It does not validate
+that the ID is a full 40-character hash or resolve branch names, tags, commit
+IDs to their root trees, or path expressions.
+
+=== Output
+
+Without `--name-only`, each entry is printed as:
+
+[source,text]
+----
+<mode> <object-type> <object-id><TAB><name>
+----
+
+The mode is padded to at least six characters for display. Mode `40000` is
+reported as type `tree`, mode `160000` as type `commit`, and all other modes as
+type `blob`. With `--name-only`, one entry name is printed per line.
+
+The listing is not recursive: it shows only the entries directly inside the
+specified tree. To inspect a nested directory, its tree ID must be listed
+separately.
+
+=== Current limitations
+
+* The command does not implement path filtering or recursive listing.
+* The CLI accepts only the tree ID alone or `--name-only` followed by the
+  tree ID. Unsupported argument combinations are silently ignored by the
+  dispatcher.
+* The tree builder and object store write under `.gitty/objects`, but
+  `ls-tree` currently reads from `.git/objects`. Consequently, a tree produced
+  by `write-tree` is not normally found by `ls-tree` in the same Gitty
+  repository.
+* The reader checks that the decompressed object's header begins with `tree `,
+  but it does not verify that the supplied ID matches the object contents.
+
+If the object path is absent, or the decompressed object is not a tree, the
+command reports an error to standard error and exits with a failure status.
+
+== `commit-tree`
+
+=== Purpose and intended relationship
+
+`commit-tree` is intended to create a commit object for an existing tree and
+parent commit. The tree identifies the snapshot; the parent links the new
+commit into existing history. On success, the command stores the commit under
+`.gitty/objects` and prints its object ID.
+
+[source,shell]
+----
+bun run index.ts commit-tree <tree-id> -p <parent-commit-id> -m "message"
+----
+
+=== Inputs and validation
+
+The CLI expects the tree ID as its first argument. It looks for `-p` and `-m`
+and takes the following argument as the parent ID and commit message,
+respectively. It validates supplied IDs as 40-character lowercase
+hexadecimal strings. The CLI also intends to check that the referenced tree
+and parent objects exist in `.gitty/objects`.
+
+The command implementation requires all three values: tree ID, parent ID, and
+message. Although the CLI only validates a parent when `-p` is supplied, the
+implementation rejects a missing parent. Therefore the current implementation
+does not support creating a root commit with `commit-tree`.
+
+The author and committer identity are currently hard-coded, and the timestamp
+is generated at execution time in UTC offset `+0000`. The command does not
+accept identity or timestamp options.
+
+=== Current limitations
+
+* The CLI's object-existence helper calls `fs.existsSync` but does not return
+  its result. Its existence checks therefore always evaluate as false, and
+  valid tree IDs are rejected as not existing before `commitTreeCmd` is
+  reached.
+* Even if that CLI validation is bypassed, `commitTreeCmd` requires a parent
+  ID and commit message. It does not verify that the referenced tree is a tree
+  object or that the parent is a commit object before creating the commit.
+* The command writes directly to `.gitty/objects`; it does not update `HEAD` or
+  a branch reference. Creating a commit object alone does not move the
+  repository's current branch.
+
+Validation errors are written to standard error and terminate the process
+with a failure status.
+
+== How the commands fit together
+
+The intended data flow is:
+
+. `write-tree` snapshots the working directory and returns a root tree ID.
+. `commit-tree` uses that tree ID and a parent commit ID to create a commit
+   referring to the new snapshot.
+. `ls-tree` can inspect the entries of a tree ID.
+
+This describes the command responsibilities, not a fully working end-to-end
+sequence: `ls-tree` currently reads from a different object directory than
+the writer, and the `commit-tree` CLI's existence-check bug prevents its
+handler from running with valid object IDs.
+
+== Implementation reference
+
+* `index.ts` dispatches the CLI commands and parses their arguments.
+* `src/commands/tree/write-tree.commands.ts` starts snapshot construction from
+  the current working directory.
+* `src/commands/tree/buildTree.tree.commands.ts` recursively reads files and
+  directories and stores their blobs and trees.
+* `src/commands/tree/ls-tree.commands.ts` reads and displays tree entries.
+* `src/commands/tree/commit-tree.command.ts` assembles, hashes, and stores the
+  commit object.

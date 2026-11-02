@@ -1,0 +1,149 @@
+= Initialize a Gitty Repository
+
+== Purpose
+
+The `init` command creates the basic local metadata directory that Gitty uses
+to store repository objects and branch references. It does not create or
+modify the working files in the repository.
+
+The implementation is in
+`src/commands/init-repository.commands.ts`. The top-level CLI in `index.ts`
+chooses the current working directory, forms the `.gitty` path, and passes
+that path to `initRepo`.
+
+== Usage
+
+From the directory that should become the repository root, run:
+
+[source,shell]
+----
+bun run index.ts init
+----
+
+The package script is also configured as `gitty`, so the equivalent command
+is:
+
+[source,shell]
+----
+bun run gitty init
+----
+
+Both invocations initialize the `.gitty` directory in the current working
+directory. The command takes no repository path argument; the current working
+directory determines where the metadata directory is created.
+
+== Repository layout created
+
+On initialization, `initRepo` ensures that these directories exist:
+
+[source,text]
+----
+.gitty/
+|-- objects/
+`-- refs/
+    `-- heads/
+----
+
+The `objects` directory is the location intended for stored Gitty objects.
+`refs/heads` is the location intended for branch pointer files.
+
+The initializer also creates this file if it does not already exist:
+
+[source,text]
+----
+.gitty/HEAD
+----
+
+Its initial contents are:
+
+[source,text]
+----
+ref: refs/heads/main
+----
+
+This makes `HEAD` a symbolic reference to the `main` branch. The initializer
+does not create `.gitty/refs/heads/main`; the branch pointer is absent until
+another operation creates or updates it.
+
+== Internal execution
+
+=== 1. CLI resolves the repository path
+
+At startup, `index.ts` reads the command name from the process arguments and
+sets the working directory to `process.cwd()`. It constructs the metadata
+path as `<working-directory>/.gitty`.
+
+When the command is `init`, the CLI calls `initRepo` with that absolute path.
+The initializer itself does not calculate the repository root or append
+`.gitty`; those responsibilities belong to the CLI caller.
+
+=== 2. Object storage directory is ensured
+
+The initializer calls `fs.mkdirSync` for `<GIT_DIR>/objects` with
+`{ recursive: true }`. Recursive creation means missing parent directories are
+created as needed, and an existing directory does not cause this operation to
+fail.
+
+=== 3. Branch reference directories are ensured
+
+It next creates `<GIT_DIR>/refs/heads`, also recursively. These two directory
+creation operations run on every invocation, including reinitialization.
+
+=== 4. `HEAD` is initialized only when absent
+
+The initializer builds the path `<GIT_DIR>/HEAD` and checks whether it exists.
+
+* If it does not exist, the initializer writes `ref: refs/heads/main` followed
+  by a newline. It prints an “Initialized empty gitty repository” message and
+  returns.
+* If it already exists, the initializer leaves it untouched and prints a
+  “Reinitialized existing Git repository” message.
+
+Preserving an existing `HEAD` prevents a repeated `init` from replacing the
+current branch reference or detached-HEAD value. Reinitialization still
+ensures the `objects` and `refs/heads` directories exist, but it does not
+repair or validate existing metadata.
+
+== Idempotency and preservation
+
+The command is safe to run repeatedly in the sense that it does not overwrite
+an existing `HEAD`, object files, or branch reference files. The directory
+creation calls are recursive, so existing directories remain usable.
+
+This is not a full integrity check or migration. If `HEAD` exists but is
+malformed, or points to a branch that does not exist, `init` does not report or
+correct that condition. Similarly, it does not inspect the contents of
+`objects` or `refs`.
+
+== Output and errors
+
+On a first initialization, the command writes a success message to standard
+output containing the `.gitty` path. If `HEAD` already exists, it writes a
+reinitialization message instead. The wording of the latter currently says
+“Git repository,” although the directory being initialized is `.gitty`.
+
+The filesystem operations are wrapped in a `try`/`catch`. If an operation
+throws, the initializer writes a fatal error message and the error details to
+standard error, then exits the process with status `1`. This can happen, for
+example, if the process lacks permission to create or write in the target
+directory.
+
+== What initialization does not do
+
+The current implementation only prepares the basic metadata directories and
+the initial `HEAD` file. It does not:
+
+* Create a first commit, tree, or blob.
+* Create the `main` branch pointer file.
+* Stage or inspect working-directory files.
+* Create configuration, ignore, or description files.
+* Validate that the current directory is otherwise a clean or empty
+  repository.
+* Convert or adopt an existing `.git` repository.
+
+== Implementation reference
+
+* `index.ts` maps the `init` command to the current directory's `.gitty` path.
+* `src/commands/init-repository.commands.ts` creates the directories and
+  initializes `HEAD`.
+* `src/commands/index.commands.ts` re-exports `initRepo` for the CLI.

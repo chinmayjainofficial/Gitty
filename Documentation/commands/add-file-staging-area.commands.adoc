@@ -1,0 +1,200 @@
+= Stage Files with `add`
+
+== Purpose
+
+The `add` command records selected working-directory files in Gitty's staging
+index. For each file, it creates or reuses a blob object and updates the index
+entry for that path.
+
+The command is implemented by `addFile` in
+`src/commands/add-file-staging-area.commands.ts`. The top-level CLI in
+`index.ts` gathers the path arguments and calls it.
+
+== Usage
+
+Stage one file:
+
+[source,shell]
+----
+bun run index.ts add README.md
+----
+
+Stage multiple paths:
+
+[source,shell]
+----
+bun run index.ts add README.md src/index.ts
+----
+
+Stage every file recursively under a directory:
+
+[source,shell]
+----
+bun run index.ts add src
+----
+
+The package script can be used as a shorter entry point:
+
+[source,shell]
+----
+bun run gitty add README.md
+----
+
+The CLI passes every argument after `add` as a path. There are no flags or
+special pathspec syntax implemented by this command.
+
+== Staging index
+
+The index is stored as JSON at `.gitty/index`, relative to the process's
+current working directory. It maps normalized repository-relative paths to an
+entry containing a mode and blob hash. For example:
+
+[source,json]
+----
+{
+  "README.md": {
+    "mode": "100644",
+    "hash": "<blob-object-id>"
+  },
+  "scripts/run.sh": {
+    "mode": "100755",
+    "hash": "<blob-object-id>"
+  }
+}
+----
+
+When an index file does not exist, `readIndex` starts with an empty object.
+After staging, `writeIndex` sorts the path keys and writes formatted JSON with
+two-space indentation. Existing entries not selected by this invocation are
+preserved.
+
+== Internal operation
+
+When `addFile` runs, it follows these steps:
+
+. It rejects an empty path list with `Nothing specified, nothing added.`
+. It resolves every requested path against the supplied working directory and
+   verifies that each path exists.
+. It performs this validation for all requested paths before loading or
+   changing the index. A missing path therefore prevents index updates for
+   that invocation.
+. It reads `.gitty/index`, or uses an empty index if the file is absent.
+. For each requested path, it resolves the absolute path and collects the
+   file paths to stage.
+. For each collected file, it calculates a mode, writes or reuses the blob
+   object, computes the repository-relative index key, and assigns the index
+   entry.
+. After all requested paths have been processed, it sorts and writes the
+   complete index.
+
+The command does not print a success message. A successful invocation
+completes without output.
+
+== Path collection
+
+The `collectFiles` helper uses `fs.statSync` to determine whether a requested
+path is a directory:
+
+* If it is not a directory, the path itself is returned as one file to stage.
+* If it is a directory, its contents are read and traversed recursively.
+* During directory traversal, entries named `.git` and `.gitty` are skipped.
+
+The directory recursion stages files individually; it does not create an
+index entry for the directory. Empty directories therefore add no index
+entries.
+
+Only `.git` and `.gitty` are excluded by this helper. For example,
+`node_modules` is not excluded by `add`; this differs from the current
+`write-tree` traversal. The command also does not implement ignore-file rules.
+
+Paths are resolved relative to the working directory supplied by the CLI.
+After staging, `path.relative` is used to form the index key, and platform
+path separators are converted to `/`. The implementation does not reject
+paths outside the working directory, so a path that resolves outside it can
+produce an index key containing `..`.
+
+Because `statSync` follows symbolic links, a symlink to a directory is
+traversed as a directory and a symlink to a file is read as a file. The index
+key is based on the symlink's path, while the bytes read come from its target.
+
+== Blob creation and index entries
+
+For each file, `stageFile`:
+
+. Reads the file's metadata with `fs.statSync`.
+. Sets mode to `100755` when any executable bit (`0o111`) is present; otherwise
+  it uses `100644`.
+. Calls `hashObject` with writing enabled. That helper reads the file bytes,
+   constructs a blob object, hashes the complete object, and stores the
+   compressed object under the supplied Git directory's `objects` directory.
+. Computes a path relative to the working directory, normalizes separators to
+   `/`, and assigns `{ mode, hash }` to that path in the in-memory index.
+
+If the same file content has already been stored as a blob, content-addressed
+storage allows the existing object to be reused. Renaming a file changes its
+index path even if the blob hash stays the same.
+
+== Index and object-write behavior on failure
+
+All requested paths are checked for existence before the index is read or
+updated. This protects the index from a missing-path error in a multi-path
+invocation.
+
+The later work is not a filesystem transaction. If a read, blob write, or
+index write fails while processing paths, the in-memory index is not written
+until the final `writeIndex` call. However, blob objects successfully written
+before the failure remain in `.gitty/objects`; object files are not rolled
+back. If writing the index itself fails, the previous index may remain
+unchanged or may be affected by the underlying filesystem write behavior.
+
+Errors thrown within `addFile`, including missing paths, traversal failures,
+index parsing failures, and index-write failures, are written to standard
+error and terminate the process with status `1`. The called `hashObject`
+helper also handles its own read/write errors by writing to standard error
+and exiting with status `1`.
+
+== Repository-path details
+
+The CLI computes `GIT_DIR` as `<current-working-directory>/.gitty` and passes
+it to `addFile`. Blob objects are written using this argument. The index
+helpers, however, use the fixed relative path `.gitty/index` rather than
+receiving `GIT_DIR`.
+
+In normal CLI use, both locations resolve under the current working
+directory's `.gitty`. When calling `addFile` programmatically with a custom
+`GIT_DIR` or a different process working directory, object storage and index
+storage can therefore refer to different repository locations.
+
+The command does not check that the repository was initialized before running.
+When staging a file whose blob is not already present, blob-writing logic
+creates `.gitty/objects` and therefore its `.gitty` parent before the index is
+written. But if processing produces no files (for example, an empty
+directory), and `.gitty` does not already exist, writing `.gitty/index` fails
+because the index helper does not create its parent directory.
+
+== What `add` does not do
+
+The current implementation does not:
+
+* Remove index entries when a file is deleted from disk.
+* Stage only changed lines or content differences.
+* Apply `.gitignore` or other ignore rules.
+* Record directory entries in the index.
+* Stage empty directories.
+* Build a tree or create a commit.
+* Restrict paths to remain inside the working directory.
+* Provide partial staging, flags, or pathspec matching.
+
+Staging updates the index and stores blobs; creating a snapshot tree and
+creating a commit are separate operations in this repository.
+
+== Implementation reference
+
+* `index.ts` passes all arguments after `add` and supplies the current
+  `.gitty` path and working directory.
+* `src/commands/add-file-staging-area.commands.ts` validates paths, collects
+  files, creates index entries, and writes the index.
+* `src/commands/index/read-write.index.ts` reads and writes the JSON index.
+* `src/commands/index/index.types.ts` defines the index and entry shapes.
+* `src/fileOperations/hashObject.fileOperations.ts` constructs, hashes, and
+  stores the file blobs.

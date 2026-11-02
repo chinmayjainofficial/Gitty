@@ -1,0 +1,165 @@
+= Read an Object with `cat-file`
+
+== Purpose
+
+The `cat-file` command reads a compressed object file, decompresses it, parses
+its object header, and reports either the object type, the recorded content
+size, or the object payload.
+
+The implementation is in `src/commands/cat-file.commands.ts`. The top-level
+CLI in `index.ts` parses the command arguments and calls `catFile`.
+
+== Usage
+
+The CLI accepts the object ID after one of three flags:
+
+[source,shell]
+----
+bun run index.ts cat-file -p <object-id>
+bun run index.ts cat-file -s <object-id>
+bun run index.ts cat-file -t <object-id>
+----
+
+The package script can also be used:
+
+[source,shell]
+----
+bun run gitty cat-file -p <object-id>
+----
+
+The implementation supports these flags:
+
+[cols="1,2",options="header"]
+|===
+|Flag |Output
+
+|`-p`
+|Writes the uncompressed object payload (the bytes after the object header).
+
+|`-s`
+|Writes the content size recorded in the object header.
+
+|`-t`
+|Writes the object type recorded in the object header.
+|===
+
+== Argument handling
+
+The CLI takes `args[0]` as the flag and `args[1]` as the object ID. If either
+is missing, it writes a usage message to standard output and throws an error.
+That argument check is in the CLI, outside `catFile`'s error handler. Extra
+arguments after the object ID are not checked or used.
+
+`catFile` validates that the flag is exactly `-p`, `-s`, or `-t`. Any other
+flag produces an `unknown switch` error.
+
+The object ID is not validated for length or hexadecimal characters. The
+reader uses its first two characters as the object subdirectory and all
+remaining characters as the filename.
+
+== Internal operation
+
+When called, `catFile` performs these steps:
+
+. It rejects any flag other than `-p`, `-s`, or `-t`.
+. It splits the supplied object ID into a two-character directory prefix and
+   the remaining filename.
+. It forms the object path using the current working directory and
+   `.git/objects/<prefix>/<suffix>`.
+. It checks whether that file exists. If it does not, it reports
+   `Not a valid object name`.
+. It reads the stored file as bytes and decompresses it with zlib's
+   `inflateSync`.
+. It searches the decompressed bytes for the first null byte. The bytes before
+   that separator are treated as the header, such as `blob 12` or `commit 80`.
+. It converts the header to text and splits it at a space. The first field is
+   treated as the type and the second as the size.
+. It applies the selected flag to the parsed header or payload.
+
+Conceptually, Gitty objects have a header followed by a null separator and
+payload. `cat-file` does not reconstruct the object: it exposes the stored
+type and size fields or writes the payload bytes that follow the separator.
+
+== Output details
+
+=== Pretty-print payload (`-p`)
+
+The implementation writes the payload as a `Buffer` directly to standard
+output. It does not convert it to text, add formatting, or append a newline.
+For a blob, that payload is the file content. For a commit, it is the commit
+content. For a tree, it is binary entry data and may not be readable as
+ordinary text.
+
+=== Object size (`-s`)
+
+The size is read from the header text and printed followed by a newline. It
+is the size recorded in the object header, not a separately measured length
+of the decompressed payload. The implementation checks that this field is
+present, but does not parse it as a number or verify that it matches the
+payload length.
+
+=== Object type (`-t`)
+
+The type field from the header is printed followed by a newline. The command
+does not restrict this to known types; it reports the parsed value.
+
+== Object lookup and repository compatibility
+
+The reader currently looks under:
+
+[source,text]
+----
+.git/objects/<first-two-id-characters>/<remaining-id-characters>
+----
+
+However, this repository's initializer, `hash-object -w`, and tree object
+writer store objects under `.gitty/objects`. As a result, objects created by
+the normal Gitty commands are generally not found by `cat-file` unless a
+matching object file is also present under `.git/objects`.
+
+The command does not look up an object by branch, tag, or commit reference; it
+uses the provided value directly to construct a filesystem path. It also does
+not require the object to be a commit despite the parameter name
+`commitHash` and an implementation note: blobs, trees, and commits all use
+the same lookup and header parsing path when available at that path.
+
+== Errors and validation limits
+
+Errors thrown while validating the flag, locating the file, decompressing it,
+or parsing required header fields are caught by `catFile`. The error message
+is written to standard error and the process exits with status `1`.
+
+The implementation does not validate:
+
+* That the supplied object ID is a complete or valid hexadecimal hash.
+* That the decompressed bytes contain a well-formed object header.
+* That the header size matches the payload length.
+* That the requested object type matches any expected type.
+* That the object's content hashes to the supplied ID.
+
+Malformed or corrupt compressed data can cause decompression to throw and
+follow the same standard-error failure path. Missing arguments are handled
+separately by the CLI and may also produce the runtime's uncaught exception
+output after the usage text.
+
+== Relationship to object-writing commands
+
+`hash-object -w` reads a file, constructs a blob object, hashes and compresses
+it, and stores it in `.gitty/objects`. Tree construction likewise stores its
+objects under `.gitty/objects`. `cat-file` is intended to inspect such stored
+objects, but its current `.git/objects` lookup path is inconsistent with those
+writers.
+
+The object ID should therefore be obtained from the writer that created the
+object. `cat-file` itself does not calculate an ID or locate a file from its
+contents.
+
+== Implementation reference
+
+* `index.ts` dispatches `cat-file`, selects the flag and object ID, and
+  handles missing arguments.
+* `src/commands/cat-file.commands.ts` validates the flag, loads and inflates
+  the object, parses its header, and writes the requested output.
+* `src/fileOperations/hashObject.fileOperations.ts` writes blob objects to
+  `.gitty/objects`, which is relevant to the current object-directory
+  mismatch.
